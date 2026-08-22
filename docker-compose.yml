@@ -1,0 +1,107 @@
+services:
+  # Model runtime. No `ports:` published to the host on purpose — it's only
+  # reachable from `gateway` over the `backend` network. It still gets
+  # internet access (needed for `ollama pull`), it's just never *listening*
+  # for anything from outside this Docker network.
+  ollama:
+    image: ollama/ollama:latest
+    networks:
+      - backend
+    volumes:
+      - ollama_data:/root/.ollama
+    # Hard resource ceiling so a busy model can never starve Windows itself.
+    # See TECHNICAL_OVERVIEW.md for why these specific numbers.
+    mem_limit: 10g
+    mem_reservation: 4g
+    cpus: "8"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      OLLAMA_MAX_LOADED_MODELS: 1
+      OLLAMA_NUM_PARALLEL: 1
+      OLLAMA_KEEP_ALIVE: 5m
+    # No restart policy: if Docker Desktop restarts (e.g. after a Windows
+    # reboot), this stack should stay OFF until you deliberately run
+    # start.ps1 again — never quietly come back on its own.
+    restart: "no"
+
+  gateway:
+    build: ./gateway
+    networks:
+      - backend
+      - default
+    # Bound to loopback only: reachable from this machine for local testing
+    # (curl http://localhost:8000/...), not from your LAN, and not from the
+    # internet. The only public path in is through the cloudflared tunnel,
+    # which reaches this container over the Docker network, not this port.
+    ports:
+      - "127.0.0.1:8000:8000"
+    env_file:
+      - .env
+    mem_limit: 512m
+    cpus: "1"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # Job queue state (SQLite) for the async /v1/jobs endpoints. Needs to be
+      # a real writable volume, not tmpfs, so queued/completed jobs survive a
+      # `docker compose restart gateway` — an in-memory or tmpfs-backed store
+      # would silently lose every job on restart.
+      - gateway_data:/data
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx,sys; sys.exit(0 if httpx.get('http://localhost:8000/healthz').status_code==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: "no"
+
+  # Outbound-only connection to Cloudflare's edge. No inbound firewall/router
+  # rule exists anywhere for this stack — this is the entire public exposure.
+  # Default command below runs a free Quick Tunnel (no account/domain needed,
+  # but the *.trycloudflare.com URL changes every restart — find it with
+  # `docker compose logs cloudflared`). start.ps1 automatically layers
+  # docker-compose.tunnel.yml on top of this to switch to a stable, named
+  # tunnel once TUNNEL_TOKEN is set in .env — see cloudflared/README.md.
+  # (The cloudflared image has no shell, so this switch can't be done with an
+  # `if` inside the container — it has to be a different command entirely,
+  # chosen from outside via which compose files get loaded.)
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: ["tunnel", "--url", "http://gateway:8000"]
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    networks:
+      - default
+    mem_limit: 128m
+    cpus: "0.5"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - gateway
+    restart: "no"
+
+networks:
+  # Private network between ollama and gateway only. cloudflared is never
+  # attached to this network, so even a compromised cloudflared process has
+  # no network path to the model runtime.
+  backend:
+
+volumes:
+  # Model weights persist here across `docker compose down` / `up` cycles so
+  # you don't re-download several GB every time you start the server.
+  ollama_data:
+  # Async job queue (SQLite). Kept separate from ollama_data since it's tiny
+  # and has a completely different lifecycle (job history, not model weights).
+  gateway_data:

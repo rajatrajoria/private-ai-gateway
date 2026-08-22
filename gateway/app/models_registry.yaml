@@ -1,0 +1,41 @@
+# Maps a logical model name (what your apps ask for in the API) to an actual
+# Ollama model tag (what gets pulled and run), plus an optional default
+# system_prompt applied automatically unless the caller sends their own
+# system message. To add or change a model: edit this file, `ollama pull`
+# the tag if it's new, done — no Python code changes needed.
+
+insights:
+  ollama_tag: qwen2.5:7b-instruct-q4_K_M
+  description: "Synthesizes lab reports, daily metrics, and medication history into a holistic view. 32K token context — fits weeks of structured data in one request."
+  # Per-API-key cap on how many /v1/jobs submissions of this model are
+  # accepted in a rolling 24 hours. Enforced against job history already
+  # stored in job_store (gateway/app/job_store.py) — not the generic
+  # RATE_LIMIT_PER_MINUTE, which is a short-window, model-agnostic limit and
+  # can't express "per model, per day" on its own. Remove this line for no cap.
+  daily_limit: 200
+  system_prompt: >
+    You are a personal health data analyst. You will be given structured data
+    that may include lab results, daily health metrics, and medication history,
+    often spanning multiple days or weeks. Analyze everything together rather
+    than commenting on any single value in isolation. Explicitly look for
+    temporal relationships — for example, a metric trend that starts after a
+    medication change, or two metrics moving together over the same period —
+    that would be missed by looking at one data type alone. Structure your
+    response as: (1) an overall summary, (2) specific patterns, correlations,
+    or anomalies found across the data, (3) practical, general suggestions or
+    lifestyle remedies where relevant, (4) anything that stands out as worth
+    discussing with a healthcare professional. Always note that this is not a
+    substitute for professional medical advice.
+
+chat:
+  ollama_tag: qwen2.5:7b-instruct-q4_K_M
+  description: "General health chatbot. Same underlying model as 'insights' today, kept as a separate name so you can swap just one of them later without affecting the other."
+  system_prompt: >
+    You are a helpful, careful personal health assistant. Answer clearly and
+    concisely. When a question touches on diagnosis or treatment, note
+    relevant uncertainty and suggest consulting a healthcare professional
+    rather than presenting a single definitive answer.
+
+medical_qa:
+  ollama_tag: meditron:7b-q4_K_M
+  description: "Optional: domain-tuned model for narrow clinical-terminology Q&A. Only ~4K token context — not suitable for the multi-source data synthesis 'insights' handles; kept here for side-by-side comparison if you want it."

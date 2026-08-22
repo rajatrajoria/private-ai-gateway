@@ -1,0 +1,6 @@
+# Layered on top of docker-compose.yml by start.ps1 only when TUNNEL_TOKEN is
+# set in .env — switches cloudflared from the default free Quick Tunnel to a
+# stable, named tunnel on your own domain. See cloudflared/README.md.
+services:
+  cloudflared:
+    command: ["tunnel", "run"]
