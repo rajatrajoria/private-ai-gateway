@@ -65,16 +65,26 @@ curl -H "Authorization: Bearer <your key from .env>" \
 
 curl -H "Authorization: Bearer <your key from .env>" \
      -H "Content-Type: application/json" \
-     -d '{"model":"insights","messages":[{"role":"user","content":"Here is a week of my lab results and daily metrics as JSON: {...}. What stands out?"}]}' \
+     -d '{"model":"chat","messages":[{"role":"user","content":"What'"'"'s a healthy resting heart rate range?"}]}' \
      http://127.0.0.1:8000/v1/chat
 ```
 
-To make it reachable by your other hosted apps over the internet, follow
-[`cloudflared/README.md`](./cloudflared/README.md) (one-time setup).
+That last one uses `/v1/chat` because `chat` responses are fast. For
+`insights` (multi-minute responses on real data), use `/v1/jobs` instead —
+see "Why two ways to call the model" below.
 
-> Until you do that, `docker compose ps` will show `cloudflared` as `Exited` —
-> that's expected (it has no tunnel token yet to connect with). `ollama` and
-> `gateway` are unaffected and work fine for local testing in the meantime.
+You now already have a public URL, without any extra setup — `start.ps1`
+starts a free Cloudflare Quick Tunnel automatically when `TUNNEL_TOKEN` is
+blank in `.env`, and prints it. Find it anytime with:
+
+```bash
+docker compose logs cloudflared | grep trycloudflare
+```
+
+That URL changes every restart, so it's for testing, not a permanent
+integration. When you're ready for a stable `api.yourdomain.com`, follow
+[`cloudflared/README.md`](./cloudflared/README.md) (one-time setup) — nothing
+else changes, `start.ps1` detects `TUNNEL_TOKEN` and switches over automatically.
 
 ## Stopping it
 

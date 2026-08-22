@@ -87,8 +87,12 @@ event loop that's also serving HTTP requests. Key functions: `create_job`,
 `claim_next_job` (atomically picks the oldest queued job and marks it
 processing — only ever called from the one worker loop, so no race to guard
 against), `finish_job`, `queue_position`, `count_recent_jobs` (backs
-per-model daily limits), and `mark_stale_processing_failed` (run once at
-startup — see "Job lifecycle" below).
+per-model daily limits), `set_ollama_tag` (records the real Ollama tag a job
+actually ran under, e.g. `qwen2.5:7b-instruct-q4_K_M`, distinct from the
+logical name the caller requested — set at processing time so it reflects
+what genuinely ran even if the registry changes later), and
+`mark_stale_processing_failed` (run once at startup — see "Job lifecycle"
+below).
 
 **`job_worker.py`** — `run_worker_loop()`, an `asyncio` task started from
 `main.py`'s lifespan hook. A simple claim-process-repeat loop, deliberately
@@ -149,6 +153,7 @@ gateway → client: 202 {job_id, status: "queued"}          <-- returns immediat
 
   [independently, in the background:]
   job_worker loop: claim_next_job()      [status=queued -> processing]
+  job_worker: resolve_model_entry -> job_store.set_ollama_tag(...)
   job_worker: with_system_prompt + ollama_client.chat(...)
   job_worker → job_store: finish_job(...) [status=processing -> done/failed]
 
@@ -163,7 +168,7 @@ visibly (`queue_position`) instead of silently piling up or timing out.
 ### Startup sequence (`main.py` lifespan)
 
 ```
-1. job_store.init_db()                       — create the jobs table if absent
+1. job_store.init_db()                       — create the jobs table if absent, run column migrations (e.g. ollama_tag) if it already exists
 2. job_store.mark_stale_processing_failed()  — fail anything orphaned by a prior crash/restart
 3. asyncio.create_task(run_worker_loop())    — start claiming queued jobs
 4. (app now serving requests)
@@ -177,9 +182,10 @@ visibly (`queue_position`) instead of silently piling up or timing out.
 |---|---|---|
 | `id` | TEXT (UUID) | Primary key, returned to the client as `job_id` |
 | `caller` | TEXT | App name from the API key, used for ownership checks and daily-limit counting |
-| `model` | TEXT | Logical model name requested |
+| `model` | TEXT | Logical model name requested (e.g. `"insights"`) |
 | `messages` | TEXT (JSON) | The original request body's messages, as submitted |
 | `status` | TEXT | `queued` \| `processing` \| `done` \| `failed` |
+| `ollama_tag` | TEXT, nullable | The real underlying model that ran this job (e.g. `"qwen2.5:7b-instruct-q4_K_M"`), set by the worker at processing time — `null` while still `queued`, and stays `null` if the job failed before a model was ever resolved (e.g. an unknown-model error) |
 | `result` | TEXT (JSON), nullable | Set on `done` |
 | `error` | TEXT, nullable | Set on `failed` |
 | `created_at` / `started_at` / `finished_at` | TEXT (ISO 8601 UTC), nullable | Timestamps for each transition |

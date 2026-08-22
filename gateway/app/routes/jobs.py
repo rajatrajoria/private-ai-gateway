@@ -69,7 +69,8 @@ async def get_job_status(job_id: str, caller: str = Depends(require_api_key)) ->
 
     response: dict = {
         "job_id": job["id"],
-        "model": job["model"],
+        "model": job["model"],  # the logical name requested, e.g. "insights"
+        "ollama_model": job["ollama_tag"],  # the real model that actually ran it, e.g. "qwen2.5:7b-instruct-q4_K_M" — null until processing starts
         "status": job["status"],
         "created_at": job["created_at"],
         "started_at": job["started_at"],

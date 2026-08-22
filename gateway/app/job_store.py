@@ -41,10 +41,18 @@ def _init_db_sync() -> None:
             error TEXT,
             created_at TEXT NOT NULL,
             started_at TEXT,
-            finished_at TEXT
+            finished_at TEXT,
+            ollama_tag TEXT
         )
         """
     )
+    # Migration for databases created before ollama_tag existed. SQLite has no
+    # "ADD COLUMN IF NOT EXISTS" — attempting to re-add an existing column
+    # raises OperationalError, which is exactly the "already migrated" case.
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN ollama_tag TEXT")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -158,6 +166,21 @@ def _claim_next_job_sync() -> dict | None:
 
 async def claim_next_job() -> dict | None:
     return await asyncio.to_thread(_claim_next_job_sync)
+
+
+def _set_ollama_tag_sync(job_id: str, ollama_tag: str) -> None:
+    conn = _connect()
+    conn.execute("UPDATE jobs SET ollama_tag = ? WHERE id = ?", (ollama_tag, job_id))
+    conn.commit()
+    conn.close()
+
+
+async def set_ollama_tag(job_id: str, ollama_tag: str) -> None:
+    """Records the real Ollama tag actually used to run this job (e.g.
+    'qwen2.5:7b-instruct-q4_K_M'), separate from the logical name the caller
+    requested (e.g. 'insights'). Set at processing time, not creation time,
+    so it reflects what actually ran even if the registry changes later."""
+    await asyncio.to_thread(_set_ollama_tag_sync, job_id, ollama_tag)
 
 
 def _finish_job_sync(job_id: str, status: str, result: dict | None, error: str | None) -> None:

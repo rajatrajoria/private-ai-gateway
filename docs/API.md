@@ -159,11 +159,19 @@ API key that submitted a job can view it — a different key gets `404`, the
 same as a nonexistent ID (so one application can't confirm another's job IDs
 are valid).
 
+Every response includes both `model` (the logical name you requested, e.g.
+`"insights"`) and `ollama_model` (the real underlying model that actually
+ran or will run it, e.g. `"qwen2.5:7b-instruct-q4_K_M"`) — useful for knowing
+exactly which weights produced a given result, especially if the registry
+gets repointed later. `ollama_model` is `null` until the job leaves `queued`,
+since the real tag is resolved at processing time, not at submission time.
+
 **While queued:**
 ```json
 {
   "job_id": "9a9318ba-...",
   "model": "insights",
+  "ollama_model": null,
   "status": "queued",
   "queue_position": 2,
   "created_at": "2026-08-22T15:20:00+00:00",
@@ -178,6 +186,7 @@ are valid).
 {
   "job_id": "9a9318ba-...",
   "model": "insights",
+  "ollama_model": "qwen2.5:7b-instruct-q4_K_M",
   "status": "processing",
   "created_at": "2026-08-22T15:20:00+00:00",
   "started_at": "2026-08-22T15:20:04+00:00",
@@ -190,6 +199,7 @@ are valid).
 {
   "job_id": "9a9318ba-...",
   "model": "insights",
+  "ollama_model": "qwen2.5:7b-instruct-q4_K_M",
   "status": "done",
   "created_at": "...",
   "started_at": "...",
@@ -203,6 +213,7 @@ are valid).
 {
   "job_id": "9a9318ba-...",
   "model": "insights",
+  "ollama_model": "qwen2.5:7b-instruct-q4_K_M",
   "status": "failed",
   "created_at": "...",
   "started_at": "...",
@@ -210,7 +221,7 @@ are valid).
   "error": "Interrupted by a server restart before this job finished."
 }
 ```
-Other `error` values include Ollama backend errors (e.g. a timeout on an unusually large payload) and `"Unknown model '<name>'"` if the registry changed between submission and processing.
+Other `error` values include Ollama backend errors (e.g. a timeout on an unusually large payload) and `"Unknown model '<name>'"` if the registry changed between submission and processing — in that failure case specifically, `ollama_model` stays `null` since no real model was ever resolved.
 
 **Recommended polling pattern:** poll every 3-5 seconds while `status` is
 `queued` or `processing`; stop once it's `done` or `failed`. There is no

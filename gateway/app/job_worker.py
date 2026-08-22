@@ -38,6 +38,7 @@ async def _process_job(job: dict) -> None:
         return
 
     messages = with_system_prompt(entry, json.loads(job["messages"]))
+    await job_store.set_ollama_tag(job["id"], entry["ollama_tag"])
 
     try:
         result = await ollama_chat(entry["ollama_tag"], messages)
