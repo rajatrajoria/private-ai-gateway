@@ -2,7 +2,7 @@
 
 ## Don't have a domain yet? You already have a public URL
 
-If `TUNNEL_TOKEN` is blank in `.env`, `start.ps1` automatically starts a free
+If `TUNNEL_TOKEN` is blank in `.env`, `start.ps1`/`start.sh` automatically starts a free
 **Quick Tunnel** instead — no Cloudflare account, no domain, no cost. It
 prints a real, working `https://<random-words>.trycloudflare.com` URL that's
 genuinely reachable from anywhere on the internet, found with:
@@ -15,7 +15,7 @@ This is enough to test that your already-hosted app can actually reach this
 gateway. The catch: that URL is randomly generated and **changes every time
 the tunnel restarts** — fine for testing, not something to hardcode into a
 production app. When you're ready for a permanent address, follow the steps
-below; nothing else about the setup changes, `start.ps1` detects
+below; nothing else about the setup changes, `start.ps1`/`start.sh` detects
 `TUNNEL_TOKEN` and switches over automatically.
 
 ## The permanent setup (one-time, needs your own domain)
@@ -44,7 +44,7 @@ scripted, since it's inherently tied to your own account.
    - URL: `gateway:8000` (this is the Docker service name — cloudflared reaches it
      over the internal Docker network, not localhost, because they're in the same
      `docker-compose.yml`)
-6. Save. Run `start.ps1` in the project root — the `cloudflared` container will
+6. Save. Run `start.ps1`/`start.sh` in the project root — the `cloudflared` container will
    pick up `TUNNEL_TOKEN` from `.env` and connect automatically.
 7. Test from *outside* your home network (phone on mobile data, for example):
    ```
@@ -61,6 +61,7 @@ PC" approach — see `TECHNICAL_OVERVIEW.md` for the full reasoning.
 
 ## Turning it off
 
-Public access exists only while the stack is running. Run `stop.ps1` in the
-project root and the tunnel connection drops immediately — `api.yourdomain.com`
-will simply stop resolving to anything until you `start.ps1` again.
+Public access exists only while the stack is running. Run `stop.ps1`/`stop.sh`
+in the project root and the tunnel connection drops immediately —
+`api.yourdomain.com` will simply stop resolving to anything until you
+`start.ps1`/`start.sh` again.

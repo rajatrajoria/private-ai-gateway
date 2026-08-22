@@ -31,18 +31,20 @@ Two independent limits apply:
 
 1. **`RATE_LIMIT_PER_MINUTE`** (default 20) — a short-window cap per API key,
    applied to `POST /v1/chat` and `POST /v1/jobs`. Exceeding it returns `429`.
-2. **Per-model daily limits** (optional, set per logical model in
+2. **Per-model daily limits** (optional, set per model tag in
    `gateway/app/models_registry.yaml` as `daily_limit: N`) — a rolling
    24-hour cap per API key *per model*, checked only on `POST /v1/jobs`.
-   `insights` currently has `daily_limit: 200`. Exceeding it returns `429`
-   with a message naming the model and limit.
+   `qwen2.5:7b-instruct-q4_K_M` currently has `daily_limit: 200`. This applies
+   across every use of that model by a given key — the gateway has no way to
+   tell "why" a model was called, only which one and by whom. Exceeding it
+   returns `429` with a message naming the model and limit.
 
 ## Two ways to call a model
 
 | | `POST /v1/chat` | `POST /v1/jobs` + `GET /v1/jobs/{id}` |
 |---|---|---|
 | Style | Synchronous — holds the connection open until done | Asynchronous — returns immediately, poll for the result |
-| Use for | `chat` (fast, seconds) | `insights` (slow, minutes) or anything that might run long |
+| Use for | Short requests (seconds) | Anything that might run long (minutes) — large payloads, big context |
 | Why | Simpler for short responses | A synchronous call this long is unreliable for most HTTP clients, and is **hard-killed after 100 seconds** by Cloudflare's free-tier tunnel regardless of local settings |
 
 If in doubt, use `/v1/jobs` — it works fine for short requests too, it's just one extra poll.
@@ -65,16 +67,16 @@ container — check `docker compose logs ollama`.
 
 ## `GET /v1/models`
 
-Lists the logical model names currently available, as defined in
-`models_registry.yaml`.
+Lists the real Ollama model names currently allowlisted, as defined in
+`models_registry.yaml`. Use one of these exact strings as `model` in your
+own requests — there's no separate alias to look up.
 
 **Response `200`:**
 ```json
 {
   "models": [
-    {"name": "insights", "description": "Synthesizes lab reports, daily metrics, and medication history into a holistic view. 32K token context — fits weeks of structured data in one request."},
-    {"name": "chat", "description": "General health chatbot. Same underlying model as 'insights' today, kept as a separate name so you can swap just one of them later without affecting the other."},
-    {"name": "medical_qa", "description": "Optional: domain-tuned model for narrow clinical-terminology Q&A. Only ~4K token context — not suitable for the multi-source data synthesis 'insights' handles; kept here for side-by-side comparison if you want it."}
+    {"name": "qwen2.5:7b-instruct-q4_K_M", "description": "General-purpose 7B model. Used today for health-data synthesis."},
+    {"name": "meditron:7b-q4_K_M", "description": "Optional: domain-tuned model for narrow clinical-terminology Q&A. Only ~4K token context."}
   ]
 }
 ```
@@ -83,33 +85,50 @@ Lists the logical model names currently available, as defined in
 
 ## `POST /v1/chat`
 
-Synchronous call. Use for `chat`; avoid for `insights` on real data (see table above).
+Synchronous call. Use for short requests; avoid for anything that might run long on real data (see table above).
 
 **Request:**
 ```json
 {
-  "model": "chat",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
   "messages": [
     {"role": "user", "content": "What's a healthy resting heart rate range?"}
   ]
 }
 ```
-`messages` follows the common `{role, content}` shape (`role` is `"user"`,
-`"assistant"`, or `"system"`). If the target model has a default
-`system_prompt` configured in the registry, it's automatically prepended
-**unless** your own `messages` already includes a `system` entry — so you can
-always override the default per-request.
+`model` must be one of the exact strings returned by `GET /v1/models` — this
+is the real Ollama tag, not an alias. `messages` follows the common
+`{role, content}` shape (`role` is `"user"`, `"assistant"`, or `"system"`).
+The gateway is a pure passthrough — `messages` goes to Ollama exactly as you
+sent it, nothing added or rewritten. Include your own `system` message if
+you want specific behavior; there is no automatic default.
 
-`stream` is accepted in the body but not yet implemented — `stream: true`
-returns `400 Bad Request`. Omit it or set `false`.
-
-**Response `200`:**
+**Response `200`** (default, `stream: false` or omitted):
 ```json
 {
-  "model": "chat",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
   "message": {"role": "assistant", "content": "A healthy resting heart rate for most adults is 60-100 beats per minute..."}
 }
 ```
+
+**`stream: true`** — returns `text/event-stream` instead: one `data:` line
+per chunk as the model generates it, ending with a literal `data: [DONE]`
+line. Each chunk's payload is shaped like Ollama's own streaming chunks:
+```
+data: {"message": {"role": "assistant", "content": "A"}, "done": false}
+
+data: {"message": {"role": "assistant", "content": " healthy"}, "done": false}
+
+data: {"message": {"role": "assistant", "content": ""}, "done": true, ...}
+
+data: [DONE]
+```
+If the backend fails partway through, one more `data:` line is sent —
+`data: {"error": "Ollama backend error: ..."}` — since the response's `200`
+status and headers are already committed by the time streaming starts, an
+error can't become an HTTP error status at that point; check for an `error`
+key in any chunk. Streaming is only available on `/v1/chat`, not `/v1/jobs`
+— see that endpoint's note below for why.
 
 **Errors:**
 | Status | Meaning |
@@ -130,7 +149,7 @@ with a job ID rather than waiting for the model.
 **Request:** identical shape to `/v1/chat`:
 ```json
 {
-  "model": "insights",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
   "messages": [
     {"role": "user", "content": "Here is my health data as JSON: {...}. What patterns do you see?"}
   ]
@@ -159,19 +178,17 @@ API key that submitted a job can view it — a different key gets `404`, the
 same as a nonexistent ID (so one application can't confirm another's job IDs
 are valid).
 
-Every response includes both `model` (the logical name you requested, e.g.
-`"insights"`) and `ollama_model` (the real underlying model that actually
-ran or will run it, e.g. `"qwen2.5:7b-instruct-q4_K_M"`) — useful for knowing
-exactly which weights produced a given result, especially if the registry
-gets repointed later. `ollama_model` is `null` until the job leaves `queued`,
-since the real tag is resolved at processing time, not at submission time.
+`model` here is the same real Ollama tag you submitted the job with —
+requests and responses both use the same identifier, there's no separate
+alias translation happening anywhere. It's `null` only while the job is
+still `queued`, since nothing has started running yet to name; it's set the
+instant processing begins.
 
 **While queued:**
 ```json
 {
   "job_id": "9a9318ba-...",
-  "model": "insights",
-  "ollama_model": null,
+  "model": null,
   "status": "queued",
   "queue_position": 2,
   "created_at": "2026-08-22T15:20:00+00:00",
@@ -185,8 +202,7 @@ since the real tag is resolved at processing time, not at submission time.
 ```json
 {
   "job_id": "9a9318ba-...",
-  "model": "insights",
-  "ollama_model": "qwen2.5:7b-instruct-q4_K_M",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
   "status": "processing",
   "created_at": "2026-08-22T15:20:00+00:00",
   "started_at": "2026-08-22T15:20:04+00:00",
@@ -198,8 +214,7 @@ since the real tag is resolved at processing time, not at submission time.
 ```json
 {
   "job_id": "9a9318ba-...",
-  "model": "insights",
-  "ollama_model": "qwen2.5:7b-instruct-q4_K_M",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
   "status": "done",
   "created_at": "...",
   "started_at": "...",
@@ -212,8 +227,7 @@ since the real tag is resolved at processing time, not at submission time.
 ```json
 {
   "job_id": "9a9318ba-...",
-  "model": "insights",
-  "ollama_model": "qwen2.5:7b-instruct-q4_K_M",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
   "status": "failed",
   "created_at": "...",
   "started_at": "...",
@@ -221,11 +235,62 @@ since the real tag is resolved at processing time, not at submission time.
   "error": "Interrupted by a server restart before this job finished."
 }
 ```
-Other `error` values include Ollama backend errors (e.g. a timeout on an unusually large payload) and `"Unknown model '<name>'"` if the registry changed between submission and processing — in that failure case specifically, `ollama_model` stays `null` since no real model was ever resolved.
+Other `error` values include Ollama backend errors (e.g. a timeout on an unusually large payload) and `"Unknown model '<name>'"` if the registry changed between submission and processing — in that failure case specifically, `model` stays `null` since no real model was ever resolved.
+
+**On cancellation** (see `DELETE` below):
+```json
+{
+  "job_id": "9a9318ba-...",
+  "model": "qwen2.5:7b-instruct-q4_K_M",
+  "status": "cancelled",
+  "created_at": "...",
+  "started_at": "...",
+  "finished_at": "...",
+  "error": "Cancelled by user request."
+}
+```
 
 **Recommended polling pattern:** poll every 3-5 seconds while `status` is
-`queued` or `processing`; stop once it's `done` or `failed`. There is no
-webhook/callback mechanism — polling is the only option today.
+`queued` or `processing`; stop once it's `done`, `failed`, or `cancelled`.
+There is no webhook/callback mechanism — polling is the only option today.
+`stream: true` is not supported on `/v1/jobs` — the point of this endpoint is
+that the client never holds a connection open, which is the opposite of what
+streaming needs; use `POST /v1/chat` with `stream: true` if you want tokens
+as they're generated.
+
+---
+
+## `DELETE /v1/jobs/{job_id}`
+
+Cancels a submitted job. Same ownership rule as `GET` — a different API key
+gets `404`.
+
+- **`queued` job:** cancelled immediately, nothing was running yet.
+- **`processing` job:** actually interrupted — the in-flight request to
+  Ollama is aborted (Ollama itself stops generating, it doesn't keep
+  computing in the background), and the worker becomes free to start the
+  next queued job right away, typically within a second. This returns
+  `status: "cancelling"` rather than `"cancelled"`, since the row update to
+  `"cancelled"` happens moments later in the background — poll `GET
+  /v1/jobs/{job_id}` to confirm.
+- **`done` / `failed` / `cancelled` job:** too late, returns `409`.
+
+**Response `200`** (queued job):
+```json
+{"job_id": "9a9318ba-...", "status": "cancelled"}
+```
+
+**Response `200`** (processing job):
+```json
+{"job_id": "9a9318ba-...", "status": "cancelling"}
+```
+
+**Errors:**
+| Status | Meaning |
+|---|---|
+| `401` | Missing/invalid API key |
+| `404` | Job doesn't exist, or belongs to a different API key |
+| `409` | Job already `done`, `failed`, or `cancelled` — nothing to cancel |
 
 ---
 
@@ -234,7 +299,7 @@ webhook/callback mechanism — polling is the only option today.
 ```bash
 # 1. Submit
 JOB=$(curl -s -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
-  -d '{"model":"insights","messages":[{"role":"user","content":"..."}]}' \
+  -d '{"model":"qwen2.5:7b-instruct-q4_K_M","messages":[{"role":"user","content":"..."}]}' \
   https://<your-url>/v1/jobs)
 JOB_ID=$(echo "$JOB" | jq -r .job_id)
 

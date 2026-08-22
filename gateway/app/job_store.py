@@ -41,18 +41,10 @@ def _init_db_sync() -> None:
             error TEXT,
             created_at TEXT NOT NULL,
             started_at TEXT,
-            finished_at TEXT,
-            ollama_tag TEXT
+            finished_at TEXT
         )
         """
     )
-    # Migration for databases created before ollama_tag existed. SQLite has no
-    # "ADD COLUMN IF NOT EXISTS" — attempting to re-add an existing column
-    # raises OperationalError, which is exactly the "already migrated" case.
-    try:
-        conn.execute("ALTER TABLE jobs ADD COLUMN ollama_tag TEXT")
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
     conn.close()
 
@@ -168,21 +160,6 @@ async def claim_next_job() -> dict | None:
     return await asyncio.to_thread(_claim_next_job_sync)
 
 
-def _set_ollama_tag_sync(job_id: str, ollama_tag: str) -> None:
-    conn = _connect()
-    conn.execute("UPDATE jobs SET ollama_tag = ? WHERE id = ?", (ollama_tag, job_id))
-    conn.commit()
-    conn.close()
-
-
-async def set_ollama_tag(job_id: str, ollama_tag: str) -> None:
-    """Records the real Ollama tag actually used to run this job (e.g.
-    'qwen2.5:7b-instruct-q4_K_M'), separate from the logical name the caller
-    requested (e.g. 'insights'). Set at processing time, not creation time,
-    so it reflects what actually ran even if the registry changes later."""
-    await asyncio.to_thread(_set_ollama_tag_sync, job_id, ollama_tag)
-
-
 def _finish_job_sync(job_id: str, status: str, result: dict | None, error: str | None) -> None:
     conn = _connect()
     conn.execute(
@@ -195,3 +172,26 @@ def _finish_job_sync(job_id: str, status: str, result: dict | None, error: str |
 
 async def finish_job(job_id: str, status: str, result: dict | None = None, error: str | None = None) -> None:
     await asyncio.to_thread(_finish_job_sync, job_id, status, result, error)
+
+
+def _cancel_if_queued_sync(job_id: str) -> bool:
+    """Atomic compare-and-set: only cancels if it's still 'queued' at the
+    exact moment this runs. Guards the race where the worker claims the job
+    (queued -> processing) between the API handler's initial status check and
+    this call — without the WHERE clause, we could stomp a status the worker
+    just set, silently losing a job that was actually already running."""
+    conn = _connect()
+    cursor = conn.execute(
+        "UPDATE jobs SET status = 'cancelled', error = ?, finished_at = ? WHERE id = ? AND status = 'queued'",
+        ("Cancelled by user request.", _now(), job_id),
+    )
+    conn.commit()
+    cancelled = cursor.rowcount > 0
+    conn.close()
+    return cancelled
+
+
+async def cancel_if_queued(job_id: str) -> bool:
+    """Returns True if the job was queued and is now cancelled; False if it
+    had already left the queued state (already processing/done/etc)."""
+    return await asyncio.to_thread(_cancel_if_queued_sync, job_id)

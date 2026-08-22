@@ -14,8 +14,8 @@ Internet ──HTTPS──▶ Cloudflare Edge ──outbound tunnel──▶ [cl
                                                     [gateway container: FastAPI]
                                                     - checks API key (Bearer token)
                                                     - rate-limits per key
-                                                    - looks up "insights" in the
-                                                      model registry → real tag
+                                                    - checks the requested model
+                                                      against the registry allowlist
                                                                   │
                                                      (Docker "backend" network)
                                                                   ▼
@@ -101,7 +101,7 @@ the rest free for Windows and whatever else you're doing while the server runs.
 
 Three Ollama environment variables tune its own internal memory behavior:
 - `OLLAMA_MAX_LOADED_MODELS=1` — never keep two models resident in RAM
-  simultaneously, even if two different logical names get requested back to back
+  simultaneously, even if two different tags get requested back to back
 - `OLLAMA_NUM_PARALLEL=1` — process one inference request at a time, so RAM use
   per request stays predictable (the alternative is Ollama batching concurrent
   requests, which multiplies memory use)
@@ -252,6 +252,59 @@ latency. The only ways to genuinely raise throughput are reducing the work
 per request (Section 6.6's data pre-filtering) or acquiring more real compute
 (a GPU, cloud burst-out, better hardware) — this project does neither today.
 
+### Cancelling a job mid-flight — `DELETE /v1/jobs/{id}`
+
+A submitted job you no longer want shouldn't have to run to completion just
+because it already started. Cancelling a `queued` job is trivial (it never
+started — flip the row to `cancelled` and it's done), but cancelling a
+`processing` job is a genuinely different problem: the worker loop is sitting
+in the middle of `await ollama_chat(...)`, and there's no flag it checks
+between one token and the next — it's one blocking-from-our-perspective
+`await`, not a loop with checkpoints.
+
+**The mechanism**: each job's processing runs as its own child `asyncio.Task`
+(`job_worker._current_job_task`), separate from the outer `while True` loop
+task that claims jobs. `DELETE` calls `_current_job_task.cancel()` on it
+directly. Python's asyncio delivers this as an `asyncio.CancelledError`
+raised at the task's current await point — which is exactly the `httpx` call
+to Ollama — and `httpx`/`httpcore` respond to that by tearing down the
+connection. Two things had to be true for this to actually work rather than
+just look like it works:
+
+1. **The outer loop must survive the cancellation.** Cancelling the *outer*
+   task would kill the `while True` entirely — no more jobs, ever. That's why
+   processing runs as a *separate* child task: only the child is cancelled,
+   the parent loop's own `await self._current_job_task` catches the resulting
+   `CancelledError` and simply moves on to `claim_next_job()` again.
+2. **Ollama must actually stop computing, not just lose its HTTP client.**
+   If closing our connection didn't make Ollama's own server abandon the
+   generation, it would keep burning CPU for a response nobody will ever
+   read — and worse, since `OLLAMA_NUM_PARALLEL=1`, that abandoned generation
+   would still be occupying Ollama's *one* processing slot, so the *next*
+   queued job would sit blocked behind it exactly as long as if we'd never
+   cancelled anything. This isn't something to assume — it depends on
+   `llama.cpp`'s server actually detecting a client disconnect, which is an
+   implementation detail of Ollama's HTTP server, not documented behavior we
+   can rely on without checking.
+
+   Checked it live: cancelling a job mid-essay produced this line in
+   `docker compose logs ollama` —
+   ```
+   srv          stop: cancel task, id_task = 22
+   ```
+   — Ollama's own server explicitly noticed and aborted. The next queued job
+   (a trivial one-word prompt) went from claimed to fully `done` in under a
+   second, with the model already warm — proof the slot was actually free,
+   not just that our own bookkeeping said so.
+
+**Why the response says `"cancelling"`, not `"cancelled"`, for a processing
+job**: `DELETE` returns the moment `.cancel()` is scheduled, not once
+`job_store.finish_job(id, "cancelled")` has actually run inside the
+cancelled task's `except` block — that write happens a beat later, in a
+different coroutine. Saying `"cancelled"` immediately would be a small lie
+about what's actually true at that instant; polling `GET /v1/jobs/{id}`
+confirms the terminal state once it lands.
+
 ## 6. Authentication — Bearer tokens and timing attacks
 
 Each of your apps gets its own API key (`API_KEYS=medicalapp:sk-xxx,...` in
@@ -359,20 +412,25 @@ Now that you've seen the pattern, here's how you'd extend it without needing to
 ask for help:
 - **Add a new model**: edit `models_registry.yaml`, `ollama pull` the tag,
   restart the gateway. That's the whole exercise — try pulling
-  `llama3.1:8b-instruct-q4_K_M` under a new key and comparing its answers
-  against `insights` on the same input.
-- **Per-model system prompts**: each registry entry can carry an optional
-  `system_prompt`, auto-prepended to any request that doesn't already include
-  its own system message (see `gateway/app/routes/chat.py`). This is what lets
-  `insights` and `chat` share the same underlying weights
-  (`qwen2.5:7b-instruct-q4_K_M`) but behave differently — the prompt, not the
-  model, defines the behavior. Tuning "how should it reason about my data" is
-  a YAML edit, not a code change.
-- **Add streaming responses**: the `stream` field already exists in the
-  request schema (`gateway/app/routes/chat.py`) and is rejected with a clear
-  error today. Implementing it means changing `ollama_client.chat()` to consume
-  Ollama's streamed NDJSON response and re-emit it as Server-Sent Events from
-  the FastAPI route — a good next exercise once the base system feels solid.
+  `llama3.1:8b-instruct-q4_K_M` and comparing its answers against
+  `qwen2.5:7b-instruct-q4_K_M` on the same input (both are just entries in
+  the registry, called by their own tag).
+- **The gateway is a deliberate pure passthrough**: `messages` goes to Ollama
+  exactly as a caller sends it — nothing added, nothing rewritten, ever. An
+  earlier version auto-injected a default `system_prompt` per model when a
+  caller didn't supply one, but that was removed: it was never exercised in
+  practice (real callers always send their own), and it quietly contradicted
+  the "what you request is what runs" principle behind addressing models by
+  real tag. If you want default behavior per model, that's a legitimate
+  thing to add back — just be explicit that it's happening, e.g. surface it
+  in `GET /v1/models`'s response rather than injecting it silently.
+- **Streaming and job cancellation are both done** (`/v1/chat`'s `stream:
+  true` and `DELETE /v1/jobs/{id}` — see Section 5's cancellation subsection
+  for how the latter actually interrupts Ollama, not just marks a row). Worth
+  reading `job_worker.py` end to end once you've read this doc, as the
+  clearest example in the codebase of "the naive version looks the same as
+  the correct version until you actually test it."
 - **Per-key usage dashboards**: the gateway already knows which app name made
-  each request (`caller` in `chat.py`) — logging that with a timestamp and
-  token count to a file or SQLite database is a small, self-contained addition.
+  each request (`caller` in `chat.py`/`jobs.py`) — logging that with a
+  timestamp and token count to a file or SQLite database is a small,
+  self-contained addition.

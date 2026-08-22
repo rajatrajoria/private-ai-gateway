@@ -6,38 +6,57 @@ For the API itself, see [`docs/API.md`](API.md).
 
 ## Prerequisites
 
-- **Docker Desktop**, with the WSL2 backend (Windows). Requires hardware
-  virtualization enabled — if Docker Desktop shows "Virtualization support
-  not detected," see Troubleshooting below.
+- **Docker** — Docker Desktop with the WSL2 backend on Windows, Docker
+  Desktop on Mac, or Docker Engine on Linux. Requires hardware virtualization
+  enabled on Windows — if Docker Desktop shows "Virtualization support not
+  detected," see Troubleshooting below.
 - A terminal (PowerShell on Windows, any shell elsewhere).
+- You do **not** need to install or start Docker yourself first —
+  `start.ps1`/`start.sh` check for it and try to start it for you (see below).
 
 ## Starting and stopping
 
 ```bash
-./start.ps1
+./start.ps1   # Windows
+./start.sh    # Mac/Linux
 ```
 What it does, in order:
-1. Creates `.env` from `.env.example` if missing (first run only).
-2. Checks whether `TUNNEL_TOKEN` is set in `.env`, and picks the matching
+1. **Checks Docker is installed** — exits with an install link if not.
+2. **Checks Docker is running** (`docker info`). If not:
+   - Windows: checks `wsl --status` first (WSL2 is Docker Desktop's
+     backend) — if WSL2 isn't installed/enabled, it stops and tells you to
+     run `wsl --install` yourself in an elevated shell and reboot (this
+     script deliberately doesn't do that for you — it's a system-level
+     change that needs an elevated prompt and typically a restart). If WSL2
+     looks fine, it launches Docker Desktop and waits up to ~2 minutes for
+     the engine to come up.
+   - Mac: runs `open -a Docker` (launches Docker Desktop) and waits.
+   - Linux: runs `sudo systemctl start docker` and waits (will prompt for a
+     password if needed, same as running it by hand).
+3. Creates `.env` from `.env.example` if missing (first run only).
+4. Checks whether `TUNNEL_TOKEN` is set in `.env`, and picks the matching
    Docker Compose file set: just `docker-compose.yml` (free Quick Tunnel) if
    blank, or that plus `docker-compose.tunnel.yml` (your stable named tunnel)
    if set.
-3. Runs `docker compose up -d --build` — builds the gateway image if its
+5. Runs `docker compose up -d --build` — builds the gateway image if its
    source changed, starts all three containers in the background.
-4. Polls `http://127.0.0.1:8000/healthz` every 2 seconds (up to 60s) until
+6. Polls `http://127.0.0.1:8000/healthz` every 2 seconds (up to 60s) until
    the gateway responds, so you get a clear "up" or "not up" signal.
-5. If using the Quick Tunnel, greps `docker compose logs cloudflared` for the
+7. If using the Quick Tunnel, greps `docker compose logs cloudflared` for the
    `trycloudflare.com` URL and prints it.
-6. Prints `docker compose ps` so you can see final container status.
+8. Prints `docker compose ps` so you can see final container status.
 
 ```bash
-./stop.ps1
+./stop.ps1   # Windows
+./stop.sh    # Mac/Linux
 ```
 What it does:
 1. Checks for any job still `queued` or `processing` (via a one-off script,
    `gateway/app/check_pending_jobs.py`, run inside the gateway container) and
    warns you — a `processing` job will be marked `failed` since it can't
    resume; a `queued` one is safe and will simply run after the next start.
+   (Or use `DELETE /v1/jobs/{id}` beforehand to cancel a job cleanly instead
+   of letting it be force-failed by shutdown — see `docs/API.md`.)
 2. Runs `docker compose down` — stops and **removes** all three containers
    and the network. This is not `docker compose stop`: `stop` merely pauses
    containers and leaves them holding their resources; `down` fully removes
@@ -69,15 +88,14 @@ Run these from the `private-ai-gateway/` directory.
 ## Adding or changing a model
 
 1. Find the tag on [ollama.com/library](https://ollama.com/library) — **verify it exists before pulling**; a wrong or community-namespace tag (e.g. a model only available as `someuser/modelname`, not in the official library) will fail with `pull model manifest: file does not exist`.
-2. Edit [`gateway/app/models_registry.yaml`](../gateway/app/models_registry.yaml):
+2. Edit [`gateway/app/models_registry.yaml`](../gateway/app/models_registry.yaml) — keyed directly by the tag, since that's what callers will put in their request's `model` field:
    ```yaml
-   your_model_name:
-     ollama_tag: <the tag>
+   your-tag-here:7b-instruct-q4_K_M:
      description: "What this is for"
-     system_prompt: >
-       Optional default behavior instructions.
      daily_limit: 200   # optional per-key daily cap, checked on /v1/jobs only
    ```
+   The gateway never adds or rewrites anything in a request's `messages` —
+   include your own `system` message if you want specific default behavior.
 3. `docker compose exec ollama ollama pull <the tag>`
 4. No gateway restart needed — the registry file is read fresh on every request.
 
@@ -156,7 +174,10 @@ The gateway runs as a non-root user (`appuser`, uid 10001) with a read-only root
 Check the worker loop is actually alive: `docker compose logs gateway` should show it periodically claiming jobs (or check `docker compose ps` — if the `gateway` container isn't `Up`, nothing is processing). Also check `GET /v1/jobs/{id}` for `queue_position` — a nonzero position means other jobs are legitimately ahead of it; jobs are processed strictly one at a time.
 
 ### A job is stuck `processing` and never finishes
-If the gateway container was restarted, any job that was `processing` at that moment is automatically marked `failed` on the next startup (`job_store.mark_stale_processing_failed`, run from `main.py`'s lifespan hook) — it can't resume, so poll again after a restart rather than waiting indefinitely.
+If the gateway container was restarted, any job that was `processing` at that moment is automatically marked `failed` on the next startup (`job_store.mark_stale_processing_failed`, run from `main.py`'s lifespan hook) — it can't resume, so poll again after a restart rather than waiting indefinitely. If it's just taking longer than you want and the container is fine, cancel it: `DELETE /v1/jobs/{id}` actually interrupts the in-flight Ollama request (confirmed live — see `TECHNICAL_OVERVIEW.md` §5), it doesn't just mark the row cancelled while Ollama keeps computing.
+
+### `start.ps1`/`start.sh` says Docker didn't come up in time
+Docker Desktop's first cold start after a reboot can genuinely take longer than the script's ~2-minute wait, especially with other heavy apps already running. Just re-run the script once Docker Desktop's whale icon in the tray/menu bar shows "Docker Desktop is running" — everything after the Docker check is safe to re-run. On Windows, if the script instead says WSL2 isn't installed/enabled, that's a one-time fix: run `wsl --install` in an **elevated** PowerShell, reboot, then re-run the script.
 
 ### `docker compose up` with the tunnel override fails or does nothing different
 Confirm `TUNNEL_TOKEN` is actually non-empty in `.env` — `start.ps1` decides which compose files to load based on a regex match against that value, not just the file existing.
