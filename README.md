@@ -25,8 +25,15 @@ understand *why* this is built this way, not just *how* to run it.
   request doesn't pay Ollama's cold-load penalty
 - **`cloudflared`** — an outbound-only tunnel that gives your gateway a public
   HTTPS URL without opening any port on your router
+- **`webui`** ([Open WebUI](https://github.com/open-webui/open-webui)) — a
+  private, local-only chat interface for talking to your models directly
+  (prompt testing, comparing models, whatever you want to poke at). Bound to
+  `127.0.0.1:3000` and never routed through the tunnel, so it's never reachable
+  from the internet. Talks straight to Ollama, bypassing the gateway's
+  API-key auth entirely — that auth exists for traffic arriving over the
+  public internet, which this never does
 
-All three run together via Docker Compose and stop/start as one unit.
+All four run together via Docker Compose and stop/start as one unit.
 
 ## Requirements
 
@@ -86,6 +93,17 @@ curl -H "Authorization: Bearer <your key from .env>" \
 That used `/v1/chat` because it's a short question. For anything that might
 take more than a minute or so on real data, use `/v1/jobs` instead — see
 "Why two ways to call the model" below.
+
+You also have a private chat UI running at
+[http://127.0.0.1:3000](http://127.0.0.1:3000) — only reachable from this
+machine. **Use the "Qwen2.5 7B (tuned)" model in its selector, not the raw
+`qwen2.5:7b-instruct-q4_K_M` entry** — the raw entry has no thread/context
+settings attached, so on a cold model load it falls back to Ollama's own
+defaults (auto-detected thread count, ~4K context), silently reintroducing
+the exact performance and context-truncation bugs documented in
+`TECHNICAL_OVERVIEW.md` §4. The "(tuned)" preset pins the same
+`num_thread`/`num_ctx` values the gateway itself uses, and is already set as
+the default model so a fresh browser session picks it automatically.
 
 You now already have a public URL, without any extra setup — `start.ps1`/
 `start.sh` starts a free Cloudflare Quick Tunnel automatically when

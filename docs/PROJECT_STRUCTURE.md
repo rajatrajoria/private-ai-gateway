@@ -11,7 +11,7 @@ alongside this project (`Private_AI_Gateway_Case_Study.docx`).
 
 ```
 private-ai-gateway/
-├── docker-compose.yml          # the 3-container stack: ollama, gateway, cloudflared
+├── docker-compose.yml          # the 4-container stack: ollama, gateway, webui, cloudflared
 ├── docker-compose.tunnel.yml   # override: switches cloudflared to a stable named tunnel
 ├── .env.example                # documented template — copy to .env, never commit .env
 ├── start.ps1 / stop.ps1        # lifecycle scripts, Windows (see docs/OPERATIONS.md)
@@ -260,7 +260,7 @@ whole point of interrupting it rather than just marking it cancelled locally.
 
 | Decision | Why (see TECHNICAL_OVERVIEW.md for full reasoning) |
 |---|---|
-| Docker Compose, 3 containers | Portable across OS, network-segmentable, atomic clean stop via `down` |
+| Docker Compose, 4 containers | Portable across OS, network-segmentable, atomic clean stop via `down` |
 | Cloudflare Tunnel over port forwarding | Outbound-only — no inbound port on the router to scan/attack |
 | Qwen2.5-7B-Instruct over Meditron/BioMistral | Actual use case needed long-context structured-data synthesis, not medical trivia Q&A; 32K vs 4K context was decisive |
 | `OLLAMA_NUM_THREAD` pinned explicitly | Ollama's auto-detected thread count ignores Docker's cgroup CPU quota — mismatch caused a 38x slowdown |
@@ -277,6 +277,8 @@ whole point of interrupting it rather than just marking it cancelled locally.
 | `DELETE /v1/jobs/{id}` cancels via `asyncio.Task.cancel()`, not a cooperative flag | A flag the worker checks between steps can't interrupt an in-flight `await` on Ollama's response — the worker would just keep blocking on that one call regardless. Cancelling the task directly raises `CancelledError` at that exact await point, closing the connection immediately; confirmed live via Ollama's own `srv stop: cancel task` log line, not assumed |
 | Warm-up targets only the first registry entry, not every model | `OLLAMA_MAX_LOADED_MODELS=1` means only one model is ever resident in RAM — warming a second model would immediately evict the first, wasting both warm-ups for whichever model is actually requested first in practice |
 | Streaming (SSE) added to `/v1/chat` only, not `/v1/jobs` | The entire point of `/v1/jobs` is decoupling submission from execution so the client never holds a connection open — streaming requires exactly the opposite (an open connection for the stream's duration), so it doesn't fit that endpoint's purpose |
+| Added Open WebUI (`webui`) talking directly to Ollama, bypassing the gateway | A private, local-only chat UI for interactive testing doesn't need API-key auth or rate limits — those exist for traffic arriving over the public internet, which this never does (bound to `127.0.0.1`, no tunnel route). Adding an auth layer here would be friction with no corresponding security benefit |
+| Created a custom "Qwen2.5 7B (tuned)" model preset in Open WebUI with pinned `num_thread`/`num_ctx` | Open WebUI is a separate client hitting Ollama directly — it doesn't know the gateway pins these values, and a cold model load through the raw model entry silently reintroduces the exact thread-oversubscription and context-truncation bugs from Section 4 of `TECHNICAL_OVERVIEW.md`. Confirmed via a real cold-load test (`ollama stop` then a fresh request), not assumed |
 
 ## Known limitations / open items
 

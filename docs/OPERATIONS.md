@@ -39,7 +39,7 @@ What it does, in order:
    blank, or that plus `docker-compose.tunnel.yml` (your stable named tunnel)
    if set.
 5. Runs `docker compose up -d --build` — builds the gateway image if its
-   source changed, starts all three containers in the background.
+   source changed, starts all four containers in the background.
 6. Polls `http://127.0.0.1:8000/healthz` every 2 seconds (up to 60s) until
    the gateway responds, so you get a clear "up" or "not up" signal.
 7. If using the Quick Tunnel, greps `docker compose logs cloudflared` for the
@@ -57,13 +57,39 @@ What it does:
    resume; a `queued` one is safe and will simply run after the next start.
    (Or use `DELETE /v1/jobs/{id}` beforehand to cancel a job cleanly instead
    of letting it be force-failed by shutdown — see `docs/API.md`.)
-2. Runs `docker compose down` — stops and **removes** all three containers
+2. Runs `docker compose down` — stops and **removes** all four containers
    and the network. This is not `docker compose stop`: `stop` merely pauses
    containers and leaves them holding their resources; `down` fully removes
    them, which is what actually frees RAM/CPU and drops the Cloudflare
    connection. Named volumes (model weights, job database) are *not*
    removed — only ephemeral container state is.
 3. Prints `docker compose ps` to confirm nothing is left running.
+
+## Private chat UI (Open WebUI)
+
+A local-only chat interface runs at [http://127.0.0.1:3000](http://127.0.0.1:3000) —
+reachable only from this machine, never through the tunnel. Use it for
+interactively testing prompts or comparing models without writing curl
+commands.
+
+**Always select "Qwen2.5 7B (tuned)" in the model dropdown, not the raw
+`qwen2.5:7b-instruct-q4_K_M` entry.** The raw entry has no thread/context
+options attached, so a cold model load falls back to Ollama's own defaults —
+silently reintroducing the exact thread-oversubscription and context-window
+bugs described in `TECHNICAL_OVERVIEW.md` §4. The tuned preset is already
+set as the default model, so this only matters if you explicitly switch
+away from it. If you ever recreate the `webui` container from scratch (e.g.
+`docker compose down -v`, which wipes the `webui_data` volume), you'll need
+to re-create that preset: Workspace → Models → Create, base model
+`qwen2.5:7b-instruct-q4_K_M`, Advanced Params → set `num_ctx` to `16384` and
+`num_thread` to `8`, save, then set it as default from the model selector.
+Also turn off every Capabilities checkbox (Vision, File Upload, Web Search,
+Image Generation, Code Interpreter, Terminal, Memory, Builtin Tools) — Open
+WebUI defaults a new model to all of them enabled, which exposes tools like
+`query_knowledge_bases` to the model even though nothing is actually
+configured for them to search, and the model will occasionally waste a turn
+trying anyway before answering normally. None of them do anything useful in
+this single-model, no-internet-search setup.
 
 ## Everyday Docker Compose commands
 
@@ -72,7 +98,7 @@ Run these from the `private-ai-gateway/` directory.
 | Command | What it does |
 |---|---|
 | `docker compose ps` | Lists this project's containers and their status |
-| `docker compose logs -f` | Streams logs from all three containers, live |
+| `docker compose logs -f` | Streams logs from all four containers, live |
 | `docker compose logs -f gateway` | Streams just the gateway's logs (Uvicorn access log — one line per request) |
 | `docker compose logs -f ollama` | Streams just Ollama's logs — model loading, per-token timing, errors |
 | `docker compose logs --tail 50 <service>` | Last 50 lines only, no follow |
@@ -156,7 +182,7 @@ Two possible causes, try in order:
 The tag doesn't exist in Ollama's official library — either a typo, or the model is only available under a community user namespace (e.g. `someuser/modelname`). Check [ollama.com/library](https://ollama.com/library) directly before assuming a tag is correct.
 
 ### A request seems to hang forever / extremely slow (well under 1 token/sec)
-Almost certainly a mismatch between `OLLAMA_NUM_THREAD` (in `.env`) and `cpus:` (in `docker-compose.yml`, `ollama` service) — they must be set to the **same** number. Ollama auto-detects the host's full core count for its thread pool by default, which oversubscribes against a smaller cgroup CPU quota and causes severe contention. Check `docker compose logs ollama` for a line like `llama threadpool init, n_threads = N` and compare it to your `cpus:` value.
+Almost certainly a mismatch between `OLLAMA_NUM_THREAD` (in `.env`) and `cpus:` (in `docker-compose.yml`, `ollama` service) — they must be set to the **same** number. Ollama auto-detects the host's full core count for its thread pool by default, which oversubscribes against a smaller cgroup CPU quota and causes severe contention. Check `docker compose logs ollama` for a line like `llama threadpool init, n_threads = N` and compare it to your `cpus:` value. If this happens from the private chat UI rather than the gateway, you're almost certainly on the raw `qwen2.5:7b-instruct-q4_K_M` entry instead of "Qwen2.5 7B (tuned)" — see "Private chat UI" above.
 
 ### Request fails with `{"detail": "Ollama backend error: "}` (empty detail)
 This is a client-side timeout (`_CHAT_TIMEOUT_SECONDS` in `gateway/app/ollama_client.py`, currently 1200s) firing before Ollama finished — httpx timeout exceptions often stringify to nothing. Check `docker compose logs ollama` for the exact point it was cancelled (`srv stop: cancel task`). If it's a genuinely large payload needing more time, either raise the timeout further or — better — use `/v1/jobs` instead of `/v1/chat` so there's no client-side timeout to hit at all.

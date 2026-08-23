@@ -21,10 +21,19 @@ Internet ──HTTPS──▶ Cloudflare Edge ──outbound tunnel──▶ [cl
                                                                   ▼
                                                     [ollama container: model runtime]
                                                     (quantized 7B model, CPU inference)
+                                                                  ▲
+                                                     (Docker "backend" network)
+                                                                  │
+                                              [webui container: Open WebUI]
+                                              127.0.0.1:3000 only — no tunnel route,
+                                              no API-key auth, never reachable publicly
 ```
 
-Three containers, one `docker-compose.yml`, two Docker networks. Nothing runs
-outside Docker except Docker Desktop itself.
+Four containers, one `docker-compose.yml`, two Docker networks. Nothing runs
+outside Docker except Docker Desktop itself. `webui` sits on the same
+`backend` network as `gateway` and talks to `ollama` directly, but has no
+route in from `cloudflared` at all — it's reachable only from this machine,
+by design (see Section 5.1).
 
 ## 2. Why each piece was chosen
 
@@ -61,7 +70,7 @@ a port with `ports: ["host:container"]` in `docker-compose.yml`.
 Look at `docker-compose.yml`:
 - `ollama` has **no `ports:` entry at all** — there is no way to reach it except
   from another container on its network. It's on the `backend` network, which
-  only `gateway` also joins. `cloudflared` was deliberately *not* added to
+  `gateway` and `webui` also join. `cloudflared` was deliberately *not* added to
   `backend` — even if `cloudflared` were somehow compromised, it has no network
   route to `ollama` at all, only to `gateway`.
 - `gateway` publishes `127.0.0.1:8000:8000` — bound to the loopback interface
@@ -172,7 +181,141 @@ for this context size, and blindly overriding a value you haven't measured
 against can make things worse, not better. Always A/B against the same
 payload before keeping a tuning change.
 
+### The same bug came back through a second door: Open WebUI
+
+Adding a private local chat UI (`webui`, Open WebUI — see Section 5.1)
+reintroduced both bugs from this section, and it's worth understanding
+exactly why, because the mechanism is genuinely non-obvious.
+
+The gateway avoids these bugs because *it* is the one calling Ollama's
+`/api/chat`, and it explicitly sets `options.num_thread`/`options.num_ctx` on
+every single call (`ollama_client.py`). Open WebUI is a completely separate
+client hitting the same Ollama instance directly — it has no idea the
+gateway ever pinned those values, and by default it doesn't set them either.
+
+Here's the part that made this easy to miss during a quick manual test:
+Ollama keeps a model loaded in RAM for `OLLAMA_KEEP_ALIVE` (5 minutes here)
+after its last request, and reuses that already-loaded instance — with
+whatever settings it was loaded with — for the *next* request, regardless of
+which client sends it. So the very first time this was tested, the gateway's
+own warm-up call (Section 7) had already loaded the model correctly moments
+earlier, and Open WebUI's chat request just rode along on those correct
+settings for free, making it *look* fixed. The real test is a cold load: stop
+the model explicitly (`docker compose exec ollama ollama stop <tag>`), then
+send a request from Open WebUI with nothing else in play. Doing exactly that
+showed it immediately —
+```
+cmn  common_param: system_info: n_threads = 14 (n_threads_batch = 14) / 14
+llama_context: n_ctx = 4096
+```
+— the identical 14-thread oversubscription and silent 4K context cap this
+section already fixed once, back from a different door.
+
+**The fix**: Open WebUI supports per-model "Advanced Params" that get merged
+into every request's `options` for that specific model entry, independent of
+whatever happens to already be loaded. A second model entry, "Qwen2.5 7B
+(tuned)," was created in Workspace → Models with `num_ctx: 16384` and
+`num_thread: 8` pinned explicitly, and set as the default model so a fresh
+browser session doesn't default to the untuned raw entry. Verified the same
+way as the original bug: stop the model, send one request through the tuned
+preset via a clean API call (not the browser UI — see the caveat below), and
+confirm the logs show `n_threads = 8` / `n_ctx = 16384` on the resulting cold
+load. They did.
+
+**A testing caveat worth recording honestly**: the first attempt to verify
+this fix through Open WebUI's own chat page appeared to fail — `ollama ps`
+still showed the old 4096 context afterward. The actual cause turned out to
+be the browser automation itself: the typed message was still sitting
+unsent in the input box (pressing Return in Open WebUI's rich-text editor
+doesn't reliably submit), so no request had gone out at all yet. A direct
+API call to `/api/chat/completions` with the same model ID settled it
+unambiguously. The lesson isn't specific to Ollama or Docker — it's that a
+UI-driven test can fail for reasons that have nothing to do with the thing
+you're actually testing, and the fix is the same one this whole project
+leans on repeatedly: when a live result contradicts what the mechanism says
+should happen, verify with the most direct tool available (here, a raw API
+call) before concluding the fix itself is wrong.
+
+**The generalizable lesson**: any setting you pin for one client calling a
+shared backend does not automatically apply to a second client calling the
+same backend — even the same physical model, even seconds apart. A cgroup
+CPU quota or a context-window override lives at the request layer here, not
+the server layer, so every new door into Ollama needs the same pins applied
+again, explicitly, on its own terms.
+
 ## 5. Cloudflare Tunnel — why this is safer than port forwarding
+
+### 5.1 A private, local-only chat UI (`webui`)
+
+Alongside the public-facing gateway, the stack also runs
+[Open WebUI](https://github.com/open-webui/open-webui) for interactively
+testing models yourself — prompt experimentation, comparing models,
+whatever you want to poke at, without writing a single curl command. It's
+bound to `127.0.0.1:3000` and connects straight to `ollama:11434` over the
+same `backend` network the gateway uses, bypassing the gateway's auth
+entirely. That's a deliberate, safe shortcut, not an oversight: the
+gateway's API-key auth and rate limits exist specifically because that
+traffic arrives over the public internet through the tunnel. Traffic to
+`webui` never does — it's bound to loopback only, and `cloudflared` has no
+route configured to it (a Cloudflare Tunnel only exposes whatever "Public
+Hostname" you explicitly create in its dashboard; adding a container creates
+no route to it automatically). `WEBUI_AUTH=false` follows the same logic — a
+login screen only *you* can ever reach adds friction, not security.
+
+One thing worth being upfront about: on first startup, Open WebUI reaches
+out to Hugging Face once to download a small embedding model it uses for its
+optional RAG features (~1 minute, cached permanently afterward in the
+`webui_data` volume — it won't repeat on later restarts). This is outbound
+only, the same category as `ollama pull` already needing internet access,
+and doesn't conflict with "private" here — private means no *inbound*
+exposure, which this still fully satisfies.
+
+`webui` gets its own resource ceiling in `docker-compose.yml` (`mem_limit:
+1g`, `cpus: "1"`), same mechanism as the other three containers — measured
+live at ~555MB RAM and near-0% CPU while idle. That cap only covers WebUI's
+*own* workload (serving pages, its own SQLite chat history, relaying
+requests) — it does zero model inference itself, so it never competes with
+the 8 threads pinned for Ollama's actual compute. Those are separate cgroup
+budgets Linux schedules independently.
+
+**Where it does compete: Ollama's one processing slot.**
+`OLLAMA_NUM_PARALLEL=1` and `OLLAMA_MAX_LOADED_MODELS=1` are set on the
+`ollama` container itself, so they apply globally to *every* client hitting
+it — `gateway` and `webui` both, with no coordination between them. The
+gateway's own job queue (SQLite, `queue_position`) only knows about requests
+that came through the gateway; a request sent from `webui` is invisible to
+it entirely, since `webui` talks straight to `ollama:11434`. So a prompt
+tested in `webui` at the exact moment a real caller's job is processing
+through the public gateway isn't queued politely behind it — it's a second
+request racing for the same one slot, and whichever arrives first wins,
+with the other one blocked and zero visibility into why (no
+`queue_position`, nothing).
+
+`OLLAMA_MAX_LOADED_MODELS=1` raises the stakes further the day a second
+model gets added: it's not "please wait," it's "the previous occupant gets
+evicted." Testing Model B in `webui` while the gateway has Model A warm for
+real traffic doesn't just slow a request down — it unloads A from RAM
+outright, so the next real request through the gateway pays a full cold-load
+penalty (the ~20+ second reload seen during warm-up testing) it wouldn't
+have paid otherwise. With only one model installed today this is dormant,
+but it's the first thing to remember once a second model is in the mix:
+`webui` and the gateway are not two independent lanes, they share one engine.
+
+**Capabilities cleanup**: Open WebUI defaults a newly created model to every
+tool capability enabled (Web Search, Knowledge Base/File Context, Code
+Interpreter, Image Generation, Terminal, Memory, Builtin Tools) — none of
+which are wired to anything real in this setup. Left on, Qwen would
+occasionally try calling `query_knowledge_bases` before answering an
+ordinary question, get an empty result (nothing has ever been uploaded to a
+Knowledge Base), and fall back to answering normally — harmless, but a
+wasted round-trip on every affected prompt. All of them were switched off on
+the "Qwen2.5 7B (tuned)" preset; `file_context` specifically needed a direct
+API round-trip to clear since its checkbox disappears from the edit form
+once File Upload is off without actually resetting the stored value — a UI
+quirk worth knowing if this preset ever needs recreating (see
+`docs/OPERATIONS.md`'s "Private chat UI" section for the exact steps).
+
+
 
 The traditional way to expose a home server is: forward a port on your router
 (e.g. 443) to your PC's local IP, then use dynamic DNS since home IPs change.

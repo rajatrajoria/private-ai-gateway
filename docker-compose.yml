@@ -65,6 +65,39 @@ services:
       start_period: 10s
     restart: "no"
 
+  # Local-only chat UI for talking to Ollama directly — prompt testing,
+  # comparing models, whatever you want to poke at interactively. Deliberately
+  # bypasses `gateway` entirely (talks straight to `ollama:11434` over the
+  # `backend` network): the gateway's API-key auth, rate limits, and model
+  # allowlist all exist because that traffic arrives over the public
+  # internet. This UI never does — it's bound to 127.0.0.1 only, and
+  # cloudflared has no route configured to it (a Cloudflare Tunnel only
+  # exposes whatever "Public Hostname" you explicitly create in its
+  # dashboard; adding this container creates no such route automatically, see
+  # cloudflared/README.md). WEBUI_AUTH is off for the same reason a lock on a
+  # door only you can reach adds friction, not security.
+  webui:
+    image: ghcr.io/open-webui/open-webui:main
+    networks:
+      - backend
+    ports:
+      - "127.0.0.1:3000:8080"
+    environment:
+      OLLAMA_BASE_URL: http://ollama:11434
+      WEBUI_AUTH: "false"
+      ANONYMIZED_TELEMETRY: "false"
+    volumes:
+      - webui_data:/app/backend/data
+    mem_limit: 1g
+    cpus: "1"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - ollama
+    restart: "no"
+
   # Outbound-only connection to Cloudflare's edge. No inbound firewall/router
   # rule exists anywhere for this stack — this is the entire public exposure.
   # Default command below runs a free Quick Tunnel (no account/domain needed,
@@ -105,3 +138,7 @@ volumes:
   # Async job queue (SQLite). Kept separate from ollama_data since it's tiny
   # and has a completely different lifecycle (job history, not model weights).
   gateway_data:
+  # Open WebUI's own chat history/settings — separate lifecycle again, and
+  # not something you'd ever want wiped by a `docker compose down -v` aimed
+  # at resetting the model cache.
+  webui_data:
